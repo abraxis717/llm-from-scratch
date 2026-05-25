@@ -36,22 +36,33 @@ from torch.nn import functional as F
 
 @dataclass
 class GPTConfig:
-    """Configuration for the SQL router GPT model."""
+    """Configuration for the SQL router GPT model.
+
+    Architecture tuned for SQL generation:
+      vocab_size=4096  – covers SQL keywords, operators, and expanded ASCII
+      n_embd=256       – small but sufficient for SQL syntax patterns
+      n_layer=4        – minimal depth, fast inference
+      n_head=8         – multi-head for attention diversity
+      block_size=256   – context window for prompt + SQL generation
+      d_ff = 4*n_embd  – standard transformer feedforward (1024)
+    """
 
     # Tokenizer
-    vocab_size: int = 97          # ASCII printable (0-94) + newline (96) + padding (95)
-    block_size: int = 128         # context window (shorter for SQL)
+    vocab_size: int = 97          # printable ASCII (32-126) = 95 chars + newline(96) + pad(0)
+    block_size: int = 256         # context window (prompt + SQL)
 
     # Transformer
-    n_layer: int = 4
-    n_head: int = 4
-    n_embd: int = 128             # embedding dimension
+    n_layer: int = 4              # minimal depth, fast inference
+    n_head: int = 8
+    n_embd: int = 256             # d_model
+    d_ff: int = 1024              # feedforward dimension (4 * n_embd)
 
     # Dropout
-    dropout: float = 0.1
+    dropout: float = 0.15          # increased from 0.1 to prevent overfitting to 22 targets
 
     # Orthogonalization regularization
-    ortho_coeff: float = 0.01     # weight for ||W@W^T - I||_F
+    ortho_coeff: float = 0.0     # disabled — ortho regularization on weight matrices 
+                                  # destroys representational capacity (uniform singular values)
 
 
 # ── Modules ──────────────────────────────────────────────────────────
@@ -107,9 +118,9 @@ class MLP(nn.Module):
         super().__init__()
         # Use a plain list (not tuple) to avoid named-tuple issues
         self.net = nn.Sequential(
-            nn.Linear(config.n_embd, 4 * config.n_embd),
+            nn.Linear(config.n_embd, config.d_ff),
             nn.GELU(),
-            nn.Linear(4 * config.n_embd, config.n_embd),
+            nn.Linear(config.d_ff, config.n_embd),
             nn.Dropout(config.dropout),
         )
 
@@ -145,7 +156,7 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(
             dict(
-                wte=nn.Embedding(config.vocab_size, config.n_embd),
+                wte=nn.Embedding(config.vocab_size, config.n_embd, padding_idx=97),
                 wpe=nn.Embedding(config.block_size, config.n_embd),
                 drop=nn.Dropout(config.dropout),
                 h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
@@ -154,8 +165,9 @@ class GPT(nn.Module):
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-        # Weight tying for small vocab
-        self.transformer.wte.weight = self.lm_head.weight
+        # Do NOT tie weights – weight tying severely constrains the embedding space
+        # and causes spectral collapse on this task. Keep wte and lm_head separate.
+        # self.transformer.wte.weight = self.lm_head.weight
 
         # Init weights
         self.apply(self._init_weights)
@@ -213,7 +225,7 @@ class GPT(nn.Module):
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 targets.view(-1),
-                ignore_index=-1,
+                ignore_index=97,
             )
 
             # Add orthogonalization regularization on key projection matrices
@@ -223,34 +235,68 @@ class GPT(nn.Module):
 
         return logits
 
-    def _compute_ortho_loss(self) -> torch.Tensor:
-        """Compute ||W @ W^T - I||_F for key and value projection matrices.
+    def compute_ortho_loss(self) -> torch.Tensor:
+        """Public alias for _compute_ortho_loss, used during training.
+        
+        ortho_loss = sum(||W@W^T - I||_F) * ortho_coeff for each linear layer's weight matrix.
+        This encourages weight matrices to be orthogonal, improving training stability.
+        
+        Returns:
+            Scalar loss tensor
+        """
+        return self._compute_ortho_loss()
 
-        This regularization encourages the attention projection matrices
+    def _compute_ortho_loss(self) -> torch.Tensor:
+        """Compute ||W @ W^T - I||_F for ALL linear layer weight matrices.
+
+        This regularization encourages all weight matrices (not just attention)
         to be orthonormal, preventing spectral collapse of the embedding space.
+        We normalize by the target rank to get a meaningful per-dimension metric.
         """
         ortho_sum = torch.tensor(0.0, device=self.lm_head.weight.device)
         count = 0
 
-        for block in self.transformer.h:
-            for name, module in block.attn.named_modules():
-                if isinstance(module, Head):
-                    for proj_name in ("key", "value"):
-                        proj = getattr(module, proj_name)
-                        W = proj.weight  # (head_size, embed_dim)
-                        if W.shape[0] >= W.shape[1]:
-                            # Square or wide: compute W @ W.T
-                            WWt = W @ W.t()
-                            I = torch.eye(WWt.shape[0], device=WWt.device)
-                            ortho_sum += (WWt - I).pow(2).sum()
-                        else:
-                            # Tall: compute W.T @ W
-                            WtW = W.t() @ W
-                            I = torch.eye(WtW.shape[0], device=WtW.device)
-                            ortho_sum += (WtW - I).pow(2).sum()
-                        count += 1
+        # Iterate ALL linear layers in the model
+        for module in self.modules():
+            if not isinstance(module, nn.Linear):
+                continue
+            W = module.weight  # (out_features, in_features)
+            if W.numel() == 0:
+                continue
 
-        return ortho_sum / max(count, 1)
+            out_f, in_f = W.shape
+
+            if in_f <= out_f:
+                # Tall or square: use W^T @ W ≈ I (columns are orthonormal)
+                WtW = W.t() @ W  # (in_f, in_f)
+                I = torch.eye(in_f, device=W.device)
+                ortho_sum += (WtW - I).pow(2).sum() / max(in_f, 1)
+            else:
+                # Wide: use W @ W^T ≈ I (rows are orthonormal)
+                WWt = W @ W.t()  # (out_f, out_f)
+                I = torch.eye(out_f, device=W.device)
+                ortho_sum += (WWt - I).pow(2).sum() / max(out_f, 1)
+
+            count += 1
+
+        # Also add embedding diversity: encourage rows of wte to be diverse
+        # by penalizing correlation between any two distinct embedding vectors
+        wte = self.transformer.wte.weight  # (vocab_size, n_embd)
+        if wte.shape[0] > 1 and wte.shape[1] > 1:
+            # Sample a manageable number of embeddings for efficiency
+            max_emb = min(wte.shape[0], 128)
+            sampled = wte[:max_emb]
+            # Normalize to unit vectors
+            norms = sampled.norm(dim=1, keepdim=True).clamp(min=1e-8)
+            sampled_normed = sampled / norms
+            # Gram matrix: G[i,j] = dot(normalized_i, normalized_j)
+            G = sampled_normed @ sampled_normed.t()  # (max_emb, max_emb)
+            I = torch.eye(max_emb, device=G.device)
+            # Off-diagonal correlation should be 0
+            mask = 1 - I
+            ortho_sum += (G * mask).pow(2).sum() / max(max_emb * (max_emb - 1), 1)
+
+        return ortho_sum / max(count + 1, 1)  # normalize by total number of regularized terms
 
     @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0,
@@ -259,21 +305,28 @@ class GPT(nn.Module):
 
         idx: (B, T) initial token sequence
         max_new_tokens: how many tokens to generate
-        temperature: sampling temperature
+        temperature: sampling temperature (0.0 = greedy argmax)
         top_k: if set, only sample from top-k logits
         """
         for _ in range(max_new_tokens):
             # Crop context to block_size
             idx_cond = idx[:, -self.config.block_size:]
             logits = self(idx_cond)
-            logits = logits[:, -1, :] / temperature
+            logits = logits[:, -1, :]
 
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.shape[-1]))
-                logits[logits < v[:, [-1]]] = float("-inf")
+            if temperature <= 0.0:
+                # Greedy: pick the highest logit directly
+                idx_next = torch.argmax(logits, dim=-1, keepdim=True)
+            else:
+                logits = logits / temperature
 
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.shape[-1]))
+                    logits[logits < v[:, [-1]]] = float("-inf")
+
+                probs = F.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1)
+
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx

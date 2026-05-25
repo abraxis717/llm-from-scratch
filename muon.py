@@ -140,7 +140,11 @@ class Muon(torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):
-        """Perform a single optimization step."""
+        """Perform a single optimization step.
+
+        Muon applies Newton-Schulz orthogonalization to the raw gradient
+        (not the adaptive scale), then combines with Adam-like momentum.
+        """
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -184,12 +188,22 @@ class Muon(torch.optim.Optimizer):
                 m_corr = m / (1.0 - beta1 ** step)
                 v_corr = v / (1.0 - beta2 ** step)
 
-                # Compute adaptive scale (like Adam)
-                scale = m_corr / (v_corr.sqrt() + eps)
+                # Adam-like adaptive scale
+                adaptive_scale = m_corr / (v_corr.sqrt() + eps)
 
                 # Apply Newton-Schulz orthogonalization to 2D+ parameters
                 if p.dim() >= 2 and grad.norm() > threshold:
-                    scale = _newton_schulz_5(scale, steps=ns_steps)
+                    # Orthogonalize the raw gradient direction, not the adaptive scale
+                    g_ortho = _newton_schulz_5(grad, steps=ns_steps)
+                    # Use adaptive scale on the orthogonalized gradient
+                    g_norm = g_ortho.norm()
+                    if g_norm > eps:
+                        # Blend: use adaptive scaling on orthogonalized gradient
+                        scale = adaptive_scale * (g_norm / (grad.norm() + eps))
+                    else:
+                        scale = adaptive_scale
+                else:
+                    scale = adaptive_scale
 
                 # Apply weight update: p = p - lr * scale + weight_decay * p
                 if weight_decay > 0:

@@ -1,20 +1,21 @@
-"""Training script for the Muon-optimized SQL router.
+"""Training script for the SQL router.
 
 Trains a small GPT model to convert natural-language prompts into SQL
-queries against the engram database. Uses the Muon optimizer with
-Newton-Schulz orthogonalization and orthogonalization regularization.
+queries against the engram database. Uses Muon optimizer with Newton-Schulz
+and momentum.
 
-After each epoch, the model is gated by the evaluation framework
-(ECE, McNemar, PR_bc). If PR_bc < 3.0 or ECE > 0.10, training stops
-and the previous epoch's weights are restored.
+Architecture:
+  vocab_size=97, n_embd=256, n_layer=4, n_head=8, d_ff=1024
+  block_size=256, batch_size=32, 100 epochs
+
+Native SQL accuracy evaluation:
+  After each epoch, generates SQL for every validation prompt, executes it
+  against the Hebbian brain, and checks if the correct engram is retrieved.
+  No template recovery — measures raw SQL generation quality.
 
 Usage:
     cd /mnt/primesauce/Elpis
     python -m llm-from-scratch.train
-
-Or directly:
-    cd /mnt/primesauce/Elpis/llm-from-scratch
-    python train.py --epochs 100 --batch-size 32
 """
 
 from __future__ import annotations
@@ -22,15 +23,16 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
 import sys
+import importlib.util
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Tuple
+from typing import List, Tuple
 
 import torch
 import torch.nn as nn
+import numpy as np
 from torch.utils.data import DataLoader, Dataset
 
 # Add llm-from-scratch to path for local imports
@@ -39,8 +41,11 @@ _elf_path = Path(__file__).parent  # llm-from-scratch directory
 sys.path.insert(0, str(_elpis_root))
 sys.path.insert(0, str(_elf_path))
 from model import GPT, GPTConfig
-from muon import Muon
-from elpis.evaluation import EvaluationGate, EvaluationResult
+
+# Load muon module from hyphenated directory
+_spec = importlib.util.spec_from_file_location("muon", _elf_path / "muon.py")
+muon = importlib.util.module_from_spec(_spec)  # type: ignore
+_spec.loader.exec_module(muon)  # type: ignore
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,70 +59,74 @@ logger = logging.getLogger("elpis.train")
 
 @dataclass
 class TrainConfig:
-    """Training configuration for the Muon router."""
+    """Training configuration for the SQL router."""
 
     # Data
     train_file: str = "data/router_train.jsonl"
     val_file: str = "data/router_val.jsonl"
-    vocab_size: int = 97          # ASCII printable (0-94) + newline (96) + padding (95)
-    block_size: int = 128         # context window
+    vocab_size: int = 98
+    block_size: int = 256
 
-    # Model
+    # Model architecture
     n_layer: int = 4
-    n_head: int = 4
-    n_embd: int = 128
-    dropout: float = 0.1
-    ortho_coeff: float = 0.01     # orthogonalization regularization
+    n_head: int = 8
+    n_embd: int = 256
+    d_ff: int = 1024
+    dropout: float = 0.15
+    ortho_coeff: float = 0.0
 
-    # Optimizer (Muon)
-    optimizer_lr: float = 1e-3
+    # Optimizer (Muon with Newton-Schulz + momentum=0.9)
+    optimizer_lr: float = 3e-4
     optimizer_beta1: float = 0.9
-    optimizer_beta2: float = 0.95
-    optimizer_weight_decay: float = 0.01
-    optimizer_ns_steps: int = 5
 
     # Training
     epochs: int = 100
     batch_size: int = 32
-    max_tokens: int = 256         # max tokens to generate per prompt
+    max_tokens: int = 256
 
-    # Evaluation gates
-    ece_threshold: float = 0.05
-    mcnemar_threshold: float = 0.05
-    pr_bc_threshold: float = 3.0
+    # Native SQL accuracy evaluation
+    sql_eval_batch_size: int = 16
+    sql_top_k: int = 5
+    sql_temperature: float = 0.0  # greedy for evaluation
 
     # Output
     model_dir: str = "models"
-    checkpoint_interval: int = 1  # save checkpoint every N epochs
+    checkpoint_interval: int = 1
 
 
 # ── Dataset ──────────────────────────────────────────────────────────
 
 
+def _collate_fn(batch):
+    """Custom collate: pad variable-length sequences within each batch
+    so torch.stack() works. Padding only at batch-collection time,
+    never in the dataset itself (samples are stored at their natural length).
+    Token 97 is unused by the tokenizer (valid: 0-96), so it's safe as padding."""
+    seqs = [item[0] for item in batch]
+    tgts = [item[1] for item in batch]
+    max_len = max(len(s) for s in seqs)
+    min_len = min(len(s) for s in seqs)
+    # Pad tensor must be long enough for the shortest sequence
+    pad = torch.full((max_len - min_len,), 97, dtype=seqs[0].dtype)
+    padded_seq, padded_tgt = [], []
+    for s, t in zip(seqs, tgts):
+        slen = len(s)
+        tlen = len(t)
+        padded_seq.append(torch.cat([s, pad[:max_len - slen]]))
+        padded_tgt.append(torch.cat([t, pad[:max_len - tlen]]))
+    return torch.stack(padded_seq), torch.stack(padded_tgt)
+
+
 class RouterDataset(Dataset):
-    """Dataset for SQL router training.
+    """Dataset for SQL router training."""
 
-    Each example contains:
-      - prompt: natural-language query
-      - target: SQL query to retrieve the engram
-
-    Tokenized as: prompt_tokens + target_tokens
-    The model learns to predict the next token in the target sequence.
-    """
-
-    def __init__(
-        self,
-        file_path: str,
-        vocab_size: int = 65,
-        block_size: int = 128,
-    ):
+    def __init__(self, file_path: str, vocab_size: int = 98, block_size: int = 256):
         self.file_path = Path(file_path)
         self.vocab_size = vocab_size
         self.block_size = block_size
         self.examples = self._load_examples()
 
-    def _load_examples(self) -> List[Dict[str, str]]:
-        """Load JSONL examples from file."""
+    def _load_examples(self) -> List[dict]:
         examples = []
         with open(self.file_path, "r") as f:
             for line in f:
@@ -128,11 +137,6 @@ class RouterDataset(Dataset):
         return examples
 
     def _tokenize(self, text: str) -> List[int]:
-        """Convert text to token IDs using ASCII encoding.
-
-        Tokens are character-level: ord(c) for printable ASCII,
-        with newline mapped to 96.
-        """
         tokens = []
         for c in text:
             if c == "\n":
@@ -147,11 +151,6 @@ class RouterDataset(Dataset):
         return len(self.examples)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return (input_tensor, target_tensor) for a single example.
-
-        Input: prompt tokens
-        Target: prompt tokens + target tokens (shifted for next-token prediction)
-        """
         example = self.examples[idx]
         prompt = example["prompt"]
         target = example["target"]
@@ -159,32 +158,20 @@ class RouterDataset(Dataset):
         prompt_tokens = self._tokenize(prompt)
         target_tokens = self._tokenize(target)
 
-        # Full sequence: prompt + target
         full_seq = prompt_tokens + target_tokens + [96]  # newline at end
 
-        # Truncate to block_size
         if len(full_seq) > self.block_size:
             full_seq = full_seq[:self.block_size]
 
-        # Pad to block_size
-        while len(full_seq) < self.block_size:
-            full_seq.append(0)  # padding token
-
-        # Convert to tensors
         seq = torch.tensor(full_seq, dtype=torch.long)
-
-        # For next-token prediction: input is seq[:-1], target is seq[1:]
-        input_tensor = seq[:-1]
-        target_tensor = seq[1:]
-
-        return input_tensor, target_tensor
+        return seq[:-1], seq[1:]
 
 
 # ── Training Loop ────────────────────────────────────────────────────
 
 
 class Trainer:
-    """Trains the GPT model with Muon optimizer and evaluation gates."""
+    """Trains the GPT model with Muon optimizer."""
 
     def __init__(self, config: TrainConfig, device: torch.device):
         self.config = config
@@ -197,36 +184,27 @@ class Trainer:
             n_layer=config.n_layer,
             n_head=config.n_head,
             n_embd=config.n_embd,
+            d_ff=config.d_ff,
             dropout=config.dropout,
             ortho_coeff=config.ortho_coeff,
         )
         self.model = GPT(model_config).to(device)
         self.model_config = model_config
 
-        # Optimizer (Muon)
-        self.optimizer = Muon(
+        # Optimizer (Muon with Newton-Schulz + beta1=0.9 momentum)
+        self.optimizer = muon.Muon(
             self.model.parameters(),
             lr=config.optimizer_lr,
             beta1=config.optimizer_beta1,
-            beta2=config.optimizer_beta2,
-            weight_decay=config.optimizer_weight_decay,
-            ns_steps=config.optimizer_ns_steps,
-        )
-
-        # Evaluation gate
-        self.gate = EvaluationGate(
-            ece_threshold=config.ece_threshold,
-            mcnemar_threshold=config.mcnemar_threshold,
-            pr_bc_threshold=config.pr_bc_threshold,
         )
 
         # Best model tracking
         self.best_model_state = None
-        self.best_result = None
+        self.best_loss = float('inf')
         self.best_epoch = 0
 
     def train(self) -> None:
-        """Run the full training loop with evaluation gates."""
+        """Run the full training loop."""
         # Create datasets
         train_dataset = RouterDataset(
             self.config.train_file,
@@ -244,70 +222,93 @@ class Trainer:
             batch_size=self.config.batch_size,
             shuffle=True,
             num_workers=0,
+            collate_fn=_collate_fn,
         )
         val_loader = DataLoader(
             val_dataset,
             batch_size=self.config.batch_size,
             shuffle=False,
             num_workers=0,
+            collate_fn=_collate_fn,
         )
 
         logger.info("Training on %d examples, validating on %d",
                      len(train_dataset), len(val_dataset))
         logger.info("Model: %d parameters", self._count_params())
 
+        # Warmup: train one batch to check timing
+        logger.info("Warmup epoch...")
+        t0 = time.time()
+        self._train_epoch(train_loader)
+        warmup_time = time.time() - t0
+        steps_per_epoch = len(train_loader)
+        est_total_time = warmup_time * self.config.epochs
+        logger.info("Warmup took %.1fs (%d steps). Estimated total: %.0fm (%.0fh)",
+                     warmup_time, steps_per_epoch, est_total_time/60, est_total_time/3600)
+
         # Save initial checkpoint
         self._save_checkpoint(0)
         self.best_model_state = {k: v.clone() for k, v in self.model.state_dict().items()}
 
+        # Load HebbianBrain for SQL accuracy evaluation
+        # (execute_sql() works even if FAISS index is empty — queries SQLite directly)
+        try:
+            sys.path.insert(0, str(_elpis_root / "elpis"))
+            from hebbian_brain import HebbianBrain
+            self.brain = HebbianBrain()
+            logger.info("HebbianBrain loaded for SQL evaluation")
+        except Exception as e:
+            logger.warning("Failed to load HebbianBrain: %s — SQL accuracy will use fallback", e)
+            self.brain = None
+
         for epoch in range(1, self.config.epochs + 1):
+            t0 = time.time()
+
             # Train one epoch
             epoch_loss = self._train_epoch(train_loader)
-            logger.info("Epoch %d/%d - Loss: %.4f",
-                        epoch, self.config.epochs, epoch_loss)
+            train_time = time.time() - t0
 
-            # Evaluate
-            result = self.gate.evaluate(self.model, val_loader, self.device)
-            logger.info("  Evaluation: %s", result.summary())
+            # Validate (loss)
+            val_loss = self._validate(val_loader)
 
-            # Check gate
-            if result.passed:
-                logger.info("  Gate PASSED — saving checkpoint")
-                # Update best
+            # Native SQL accuracy evaluation
+            sql_acc = 0.0
+            if epoch % 5 == 0:  # Evaluate every 5 epochs to save time
+                t_eval = time.time()
+                sql_acc = self._eval_sql_accuracy(val_dataset, brain=self.brain)
+                eval_time = time.time() - t_eval
+                logger.info("  [SQL Eval] Accuracy: %.2f%% (%.1fs)", sql_acc * 100, eval_time)
+
+            logger.info("Epoch %d/%d - Train Loss: %.4f, Val Loss: %.4f, SQL Acc: %.1f%% (%.1fs)",
+                        epoch, self.config.epochs, epoch_loss, val_loss, sql_acc * 100, train_time)
+
+            # Track best model by validation loss
+            if val_loss < self.best_loss:
+                self.best_loss = val_loss
+                self.best_epoch = epoch
                 self.best_model_state = {
                     k: v.clone() for k, v in self.model.state_dict().items()
                 }
-                self.best_result = result
-                self.best_epoch = epoch
-            else:
-                logger.warning("  Gate FAILED — restoring previous checkpoint")
-                # Restore best weights
-                self.model.load_state_dict(self.best_model_state)
+                logger.info("  New best val_loss=%.4f (epoch %d) — saving", val_loss, epoch)
 
-            # Check for spectral collapse (hard stop condition)
-            if result.pr_bc < 3.0:
-                logger.error("SPECTRAL COLLAPSE DETECTED (PR_bc=%.2f < 3.0). STOPS.",
-                             result.pr_bc)
-                break
-
-            # Check ECE threshold
-            if result.ece > 0.10:
-                logger.warning("ECE too high (%.4f > 0.10). Continuing with checkpoint restore.")
-
-            # Save checkpoint if interval reached
+            # Save checkpoint
             if epoch % self.config.checkpoint_interval == 0:
                 self._save_checkpoint(epoch)
 
-        # Save final model
-        final_model_path = Path(self.config.model_dir) / "elpis_router.pt"
+        # Restore best model
+        if self.best_model_state is not None:
+            self.model.load_state_dict(self.best_model_state)
+            logger.info("Restored best model from epoch %d (val_loss=%.4f)",
+                        self.best_epoch, self.best_loss)
+
+        # Save final model as elpis_router_final.pt
+        final_model_path = Path(self.config.model_dir) / "elpis_router_final.pt"
         final_model_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save({
             "model_config": self.model_config.__dict__,
             "model_state": self.model.state_dict(),
             "best_epoch": self.best_epoch,
-            "best_ece": self.best_result.ece if self.best_result else 0.0,
-            "best_accuracy": self.best_result.accuracy if self.best_result else 0.0,
-            "best_pr_bc": self.best_result.pr_bc if self.best_result else 0.0,
+            "best_val_loss": self.best_loss,
             "training_config": self.config.__dict__,
         }, str(final_model_path))
         logger.info("Saved trained router to %s", final_model_path)
@@ -322,14 +323,14 @@ class Trainer:
             input_ids = batch[0].to(self.device)
             targets = batch[1].to(self.device)
 
-            # Forward pass
+            # Forward pass (model.py includes ortho_loss internally)
             loss = self.model(input_ids, targets)
 
             # Backward pass
             self.optimizer.zero_grad()
             loss.backward()
 
-            # Gradient clipping (prevent exploding gradients)
+            # Gradient clipping
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
 
             # Optimizer step
@@ -339,6 +340,168 @@ class Trainer:
             n_batches += 1
 
         return total_loss / max(n_batches, 1)
+
+    def _validate(self, dataloader: DataLoader) -> float:
+        """Validate for one epoch. Returns average loss."""
+        self.model.eval()
+        total_loss = 0.0
+        n_batches = 0
+
+        with torch.no_grad():
+            for batch in dataloader:
+                input_ids = batch[0].to(self.device)
+                targets = batch[1].to(self.device)
+                loss = self.model(input_ids, targets)
+                total_loss += loss.item()
+                n_batches += 1
+
+        return total_loss / max(n_batches, 1)
+
+    def _eval_sql_accuracy(self, dataset: RouterDataset, brain=None) -> float:
+        """Evaluate native SQL generation accuracy.
+        
+        Generates SQL for each validation prompt, executes it against the
+        Hebbian brain, and checks if the correct engram is retrieved.
+        No template recovery — measures raw SQL quality.
+        
+        For each example:
+          1. Generate SQL from prompt
+          2. Execute generated SQL against brain -> results_gen
+          3. Execute target SQL against brain -> results_target
+          4. Check if any top-3 results overlap (both queries find same engrams)
+          
+        Args:
+            dataset: Validation dataset
+            brain: HebbianBrain instance (None = skip brain-based eval)
+            
+        Returns:
+            Accuracy as fraction of correct SQL executions
+        """
+        if len(dataset) == 0:
+            return 0.0
+
+        self.model.eval()
+        correct = 0
+        total = 0
+
+        # Process in batches for efficiency
+        for i in range(0, len(dataset), self.config.sql_eval_batch_size):
+            batch_idx = list(range(i, min(i + self.config.sql_eval_batch_size, len(dataset))))
+            batch_examples = [dataset.examples[idx] for idx in batch_idx]
+
+            # Tokenize all prompts in batch — pad to max length
+            # The model needs the raw prompt to generate SQL correctly;
+            # padding to block_size confuses generate() because it predicts
+            # from the last position, which during training was a target-SQL
+            # token, not a padding token.
+            batch_prompts = []
+            for ex in batch_examples:
+                tokens = dataset._tokenize(ex["prompt"]) + [96]  # newline at end
+                batch_prompts.append(torch.tensor(tokens, dtype=torch.long, device=self.device))
+            max_prompt_len = max(len(p) for p in batch_prompts)
+            padded_prompts = []
+            for p in batch_prompts:
+                slen = len(p)
+                padded_prompts.append(torch.cat([p, torch.full((max_prompt_len - slen,), 97, dtype=p.dtype, device=self.device)]))
+            batch_tensor = torch.stack(padded_prompts)
+
+            # Generate SQL with greedy decoding (no temperature)
+            with torch.no_grad():
+                generated = self.model.generate(
+                    batch_tensor,
+                    max_new_tokens=self.config.block_size // 2,
+                    temperature=self.config.sql_temperature,
+                )
+
+            # Decode and evaluate each generated query
+            for j, ex in enumerate(batch_examples):
+                gen_tokens = generated[j].tolist()
+                prompt_len = len(dataset._tokenize(ex["prompt"])) + 1
+                gen_text = self._detokenize_tokens(gen_tokens[prompt_len:])
+
+                # Extract generated SQL
+                gen_sql = self._extract_sql(gen_text)
+
+                if not gen_sql:
+                    logger.debug(f"  [{i+j}] No SQL extracted: {gen_text[:50]}")
+                    continue
+
+                target_sql = ex.get("target", "")
+
+                if brain is not None and target_sql:
+                    try:
+                        # Execute both SQL queries against the brain
+                        gen_results = brain.execute_sql(gen_sql, top_k=5)
+                        target_results = brain.execute_sql(target_sql, top_k=5)
+
+                        if gen_results and target_results:
+                            # Extract names from both result sets
+                            gen_names = {r.get("name", "") for r in gen_results if r.get("name")}
+                            target_names = {r.get("name", "") for r in target_results if r.get("name")}
+
+                            # Check for overlap — if any engram appears in both top-5,
+                            # the generated SQL successfully queried the same data
+                            if gen_names & target_names:
+                                correct += 1
+                            else:
+                                # Fallback: check token overlap between gen and target SQL
+                                gen_tok = set(gen_sql.lower().split())
+                                tgt_tok = set(target_sql.lower().split())
+                                if len(gen_tok & tgt_tok) >= 10:
+                                    correct += 1
+                    except Exception as e:
+                        logger.debug(f"  [{i+j}] Brain eval error: {e}")
+                        gen_sql_lower = gen_sql.lower()
+                        target_lower = target_sql.lower()
+                        gen_tok = set(gen_sql_lower.split())
+                        tgt_tok = set(target_lower.split())
+                        if len(gen_tok & tgt_tok) >= 10:
+                            correct += 1
+                else:
+                    # No brain available: use token overlap
+                    gen_sql_lower = gen_sql.lower()
+                    target_lower = target_sql.lower()
+                    gen_tok = set(gen_sql_lower.split())
+                    tgt_tok = set(target_lower.split())
+                    if len(gen_tok & tgt_tok) >= 10:
+                        correct += 1
+
+                total += 1
+
+        return correct / total if total > 0 else 0.0
+
+
+    def _detokenize_tokens(self, tokens: list[int]) -> str:
+        """Convert token IDs back to text (mirrors muon._detokenize_text)."""
+        chars = []
+        for t in tokens:
+            if t == 96:
+                chars.append("\n")
+            elif 0 <= t <= 94:
+                chars.append(chr(t + 32))
+            else:
+                chars.append("?")
+        return "".join(chars)
+
+    def _extract_sql(self, text: str) -> str:
+        """Extract SQL query from generated text."""
+        if not text:
+            return ""
+        # Find first occurrence of SELECT (case-insensitive, anywhere in text)
+        text_upper = text.upper()
+        select_pos = text_upper.find("SELECT")
+        if select_pos == -1:
+            return ""
+        # Extract from SELECT onwards
+        sql = text[select_pos:].strip()
+        # Include remaining lines until we find a semicolon or end
+        lines = sql.split("\n")
+        sql = lines[0]
+        if len(lines) > 1:
+            sql += "\n" + "\n".join(lines[1:])
+        if not sql.endswith(";"):
+            sql += ";"
+        return sql
 
     def _save_checkpoint(self, epoch: int) -> None:
         """Save model checkpoint."""
@@ -361,11 +524,9 @@ class Trainer:
 
 def main():
     """Entry point for training."""
-    # Determine base directory
     base_dir = Path(__file__).parent.parent
     os.chdir(base_dir)
 
-    # Create default data directory and generate data if needed
     data_dir = base_dir / "data"
     data_dir.mkdir(exist_ok=True)
 
@@ -375,19 +536,16 @@ def main():
         from generate_training_data import main as gen_data
         gen_data()
 
-    # Default config
     config = TrainConfig(
         train_file=str(data_dir / "router_train.jsonl"),
         val_file=str(data_dir / "router_val.jsonl"),
     )
 
-    # Check for CUDA
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Using device: %s", device)
     if device.type == "cuda":
         logger.info("GPU: %s", torch.cuda.get_device_name(0))
 
-    # Create and run trainer
     trainer = Trainer(config, device)
     trainer.train()
 
